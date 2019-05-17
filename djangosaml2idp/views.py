@@ -20,10 +20,12 @@ from saml2.authn_context import PASSWORD, AuthnBroker, authn_context_class_ref
 from saml2.config import IdPConfig
 from saml2.ident import NameID
 from saml2.metadata import entity_descriptor
+from saml2.sigver import verify_redirect_signature
 from saml2.s_utils import UnknownPrincipal, UnsupportedBinding
 from saml2.saml import NAMEID_FORMAT_UNSPECIFIED
 from saml2.server import Server
 from six import text_type
+from six import binary_type
 
 from .processors import BaseProcessor
 
@@ -42,17 +44,26 @@ def sso_entry(request):
     """ Entrypoint view for SSO. Gathers the parameters from the HTTP request, stores them in the session
         and redirects the requester to the login_process view.
     """
+
+    # Debug sessions
+
     if request.method == 'POST':
         passed_data = request.POST
         binding = BINDING_HTTP_POST
+        SAMLRequest = passed_data['SAMLRequest']
     else:
         passed_data = request.GET
+        SAMLRequest = passed_data['SAMLRequest']
+
+        if not isinstance(SAMLRequest, binary_type):
+            xml_string = SAMLRequest.encode('utf-8')
+
         binding = BINDING_HTTP_REDIRECT
 
     request.session['Binding'] = binding
 
     try:
-        request.session['SAMLRequest'] = passed_data['SAMLRequest']
+        request.session['SAMLRequest'] = SAMLRequest
     except (KeyError, MultiValueDictKeyError) as e:
         return HttpResponseBadRequest(e)
     request.session['RelayState'] = passed_data.get('RelayState', '')
@@ -115,17 +126,24 @@ class LoginProcessView(LoginRequiredMixin, IdPHandlerViewMixin, View):
         try:
             req_info = self.IDP.parse_authn_request(request.session['SAMLRequest'], binding)
         except Exception as excp:
+            logger.error('error %s', excp)
             return self.handle_error(request, exception=excp)
         # Signed request for HTTP-REDIRECT
         if "SigAlg" in request.session and "Signature" in request.session:
             _certs = self.IDP.metadata.certs(req_info.message.issuer.text, "any", "signing")
             verified_ok = False
+            logger.debug('should check signature')
+            logger.debug('_certs %s', _certs)
+            logger.debug('req_info %s', req_info)
+            logger.debug('self.IDP.sec.sec_backend %s', verify_redirect_signature)
+            d = dict(SAMLRequest = request.session['SAMLRequest'],
+                     SigAlg = request.session['SigAlg'],
+                     Signature = request.session['Signature'])
             for cert in _certs:
                 # TODO implement
-                # if verify_redirect_signature(_info, self.IDP.sec.sec_backend, cert):
-                #    verified_ok = True
-                #    break
-                pass
+                if verify_redirect_signature(d, self.IDP.sec.sec_backend, cert):
+                   verified_ok = True
+                   break
             if not verified_ok:
                 return self.handle_error(request, extra_message="Message signature verification failure", status=400)
 
